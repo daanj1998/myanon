@@ -118,9 +118,11 @@ static PyObject* get_row(PyObject* self, PyObject* args) {
                 vlen -= 2;
             }
 
-            /* Use backtick-quoted field name as key (matches config format) */
-            PyObject *key = PyUnicode_FromString(f->name);
-            PyObject *value = PyUnicode_FromStringAndSize(val, vlen);
+            /* Use backtick-quoted field name as key (matches config format).
+             * Decode with surrogateescape so non-UTF-8 (e.g. latin1) bytes
+             * round-trip instead of failing the conversion. */
+            PyObject *key = PyUnicode_DecodeUTF8(f->name, strlen(f->name), "surrogateescape");
+            PyObject *value = PyUnicode_DecodeUTF8(val, vlen, "surrogateescape");
             if (key && value) {
                 PyDict_SetItem(dict, key, value);
             }
@@ -131,18 +133,41 @@ static PyObject* get_row(PyObject* self, PyObject* args) {
     return dict;
 }
 
-static PyObject* unescape_sql_string(PyObject* self, PyObject* args) {
-    const char *input;
-    if (!PyArg_ParseTuple(args, "s", &input)) {
+/* Decode a single str argument into its raw bytes using surrogateescape, so
+ * values carrying non-UTF-8 data (latin1 dumps) survive the round trip.
+ * On success returns a new bytes object owning *buf, which the caller must
+ * release once done with the data.  On failure returns NULL with an
+ * exception set. */
+static PyObject* arg_to_bytes(PyObject* args, char** buf, Py_ssize_t* len) {
+    PyObject *str;
+    if (!PyArg_ParseTuple(args, "U", &str)) {
         return NULL;
     }
-    
-    size_t input_len = strlen(input);
+
+    PyObject *bytes = PyUnicode_AsEncodedString(str, "utf-8", "surrogateescape");
+    if (bytes == NULL) {
+        return NULL;
+    }
+    if (PyBytes_AsStringAndSize(bytes, buf, len) != 0) {
+        Py_DECREF(bytes);
+        return NULL;
+    }
+    return bytes;
+}
+
+static PyObject* unescape_sql_string(PyObject* self, PyObject* args) {
+    char *input;
+    Py_ssize_t input_len;
+    PyObject *inbytes = arg_to_bytes(args, &input, &input_len);
+    if (inbytes == NULL) {
+        return NULL;
+    }
+
     char *unescaped = mymalloc(input_len + 1);  /* Result will be same size or smaller */
-    
+
     /* Perform unescaping - handle both backslash escaping and double-quote escaping */
-    size_t j = 0;
-    for (size_t i = 0; i < input_len; i++) {
+    Py_ssize_t j = 0;
+    for (Py_ssize_t i = 0; i < input_len; i++) {
         if (input[i] == '\\' && i + 1 < input_len) {
             /* Backslash escape sequence */
             if (input[i + 1] == '\'') {
@@ -169,36 +194,39 @@ static PyObject* unescape_sql_string(PyObject* self, PyObject* args) {
             unescaped[j++] = input[i];
         }
     }
-    unescaped[j] = '\0';
-    
-    PyObject *result = PyUnicode_FromString(unescaped);
+    Py_DECREF(inbytes);
+
+    /* Re-encode with surrogateescape so non-UTF-8 bytes are handed back
+     * unchanged rather than failing the conversion. */
+    PyObject *result = PyUnicode_DecodeUTF8(unescaped, j, "surrogateescape");
     free(unescaped);
     return result;
 }
 
 static PyObject* escape_sql_string(PyObject* self, PyObject* args) {
-    const char *input;
-    if (!PyArg_ParseTuple(args, "s", &input)) {
+    char *input;
+    Py_ssize_t input_len;
+    PyObject *inbytes = arg_to_bytes(args, &input, &input_len);
+    if (inbytes == NULL) {
         return NULL;
     }
-    
+
     /* Count chars that need escaping */
-    size_t input_len = strlen(input);
-    size_t escaped_len = 0;
-    for (size_t i = 0; i < input_len; i++) {
+    Py_ssize_t escaped_len = 0;
+    for (Py_ssize_t i = 0; i < input_len; i++) {
         if (input[i] == '\'' || input[i] == '\\') {
             escaped_len += 2;  /* Double the character */
         } else {
             escaped_len++;
         }
     }
-    
+
     /* Allocate output buffer */
     char *escaped = mymalloc(escaped_len + 1);
-    
+
     /* Perform escaping */
-    size_t j = 0;
-    for (size_t i = 0; i < input_len; i++) {
+    Py_ssize_t j = 0;
+    for (Py_ssize_t i = 0; i < input_len; i++) {
         if (input[i] == '\'') {
             escaped[j++] = '\'';
             escaped[j++] = '\'';
@@ -209,9 +237,9 @@ static PyObject* escape_sql_string(PyObject* self, PyObject* args) {
             escaped[j++] = input[i];
         }
     }
-    escaped[j] = '\0';
-    
-    PyObject *result = PyUnicode_FromString(escaped);
+    Py_DECREF(inbytes);
+
+    PyObject *result = PyUnicode_DecodeUTF8(escaped, j, "surrogateescape");
     free(escaped);
     return result;
 }
@@ -717,19 +745,32 @@ anonymized_res_st *anonymize_token(bool quoted, anon_base_st *config, char *toke
             pFunc = PyObject_GetAttrString(pModule, config->pydef);
             if (pFunc && PyCallable_Check(pFunc))
             {
+                /* Decode the value with surrogateescape so arbitrary bytes
+                 * (latin1 dumps, binary text) never fail the C->Python
+                 * conversion.  'N' steals the reference to the new object. */
+                PyObject *pValue = PyUnicode_DecodeUTF8(worktoken, worktokenlen, "surrogateescape");
                 if (config->pyargs[0])
-                    pArgs = Py_BuildValue("(ss)", worktoken, config->pyargs);
+                    pArgs = Py_BuildValue("(Ns)", pValue, config->pyargs);
                 else
-                    pArgs = Py_BuildValue("(s)", worktoken);
-                pResult = PyObject_CallObject(pFunc, pArgs);
-                Py_DECREF(pArgs);
+                    pArgs = Py_BuildValue("(N)", pValue);
+                pResult = pArgs ? PyObject_CallObject(pFunc, pArgs) : NULL;
+                Py_XDECREF(pArgs);
 
                 if (pResult != NULL)
                 {
-                    const char *result = PyUnicode_AsUTF8(pResult);
+                    /* Encode back with surrogateescape so any bytes produced
+                     * (or passed through) restore to their original form. */
+                    char *result = NULL;
+                    Py_ssize_t reslen = 0;
+                    PyObject *resbytes = PyUnicode_Check(pResult)
+                        ? PyUnicode_AsEncodedString(pResult, "utf-8", "surrogateescape")
+                        : NULL;
+                    if (resbytes != NULL)
+                        PyBytes_AsStringAndSize(resbytes, &result, &reslen);
                     if (result == NULL)
                     {
                         PyErr_Print();
+                        Py_XDECREF(resbytes);
                         Py_DECREF(pResult);
                         /* Return empty result on encoding error */
                         res_st = mymalloc(sizeof(anonymized_res_st));
@@ -740,7 +781,7 @@ anonymized_res_st *anonymize_token(bool quoted, anon_base_st *config, char *toke
                         res_st->data[0] = '\0';
                         break;
                     }
-                    int result_len = strlen(result);
+                    int result_len = (int)reslen;
 
                     /* Allocate based on result size */
                     if (result_len < sizeof(((anonymized_res_st*)0)->static_buffer)) {
@@ -760,6 +801,7 @@ anonymized_res_st *anonymize_token(bool quoted, anon_base_st *config, char *toke
                     memcpy(res_st->data, result, result_len);
                     res_st->data[result_len] = '\0';
 
+                    Py_DECREF(resbytes);
                     Py_DECREF(pResult);
                 }
                 else

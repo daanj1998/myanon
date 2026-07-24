@@ -545,8 +545,8 @@ impl<'a> DumpProcessor<'a> {
     /// Tokenize a buffered tuple to extract (field_name_with_backticks, unquoted_value)
     /// pairs. Used to expose the row context to Python.
     #[cfg(feature = "python")]
-    fn extract_row_from_buffer(&self, buf: &[u8]) -> Result<Vec<(String, String)>, String> {
-        let mut row: Vec<(String, String)> = Vec::with_capacity(self.fields.len());
+    fn extract_row_from_buffer(&self, buf: &[u8]) -> Result<Vec<(String, Vec<u8>)>, String> {
+        let mut row: Vec<(String, Vec<u8>)> = Vec::with_capacity(self.fields.len());
         let mut pos = 0;
         let mut field_pos: usize = 0;
         let mut in_tuple = false;
@@ -573,10 +573,12 @@ impl<'a> DumpProcessor<'a> {
                     let (_token_type, end_pos) = self.scan_value(buf, pos)?;
                     let raw = &buf[pos..end_pos];
                     if let Some(field) = self.fields.get(field_pos) {
+                        /* Keep the raw bytes: the Python layer decodes them with
+                         * surrogateescape so non-UTF-8 values survive intact. */
                         let unquoted = if raw.len() >= 2 && raw[0] == b'\'' && raw[raw.len() - 1] == b'\'' {
-                            String::from_utf8_lossy(&raw[1..raw.len() - 1]).into_owned()
+                            raw[1..raw.len() - 1].to_vec()
                         } else {
-                            String::from_utf8_lossy(raw).into_owned()
+                            raw.to_vec()
                         };
                         row.push((format!("`{}`", field.name), unquoted));
                     }
@@ -910,17 +912,16 @@ impl<'a> DumpProcessor<'a> {
         } else {
             raw.to_vec()
         };
-        let value_str = String::from_utf8_lossy(&worktoken);
         let pydef = &self.config.tables[table_idx].fields[field_idx].infos.pydef;
         let pyargs = &self.config.tables[table_idx].fields[field_idx].infos.pyargs;
 
         #[cfg(feature = "python")]
         {
             if let Some(ref runner) = self.python_runner {
-                match runner.call(pydef, &value_str, pyargs) {
+                match runner.call(pydef, &worktoken, pyargs) {
                     Ok(result) => {
                         return AnonResult {
-                            data: result.into_bytes(),
+                            data: result,
                             quoting: QuoteMode::AsInput,
                         };
                     }
@@ -933,7 +934,7 @@ impl<'a> DumpProcessor<'a> {
 
         #[cfg(not(feature = "python"))]
         {
-            let _ = (pydef, pyargs, &value_str);
+            let _ = (pydef, pyargs, &worktoken);
             eprintln!("Python support not compiled in, cannot use pydef");
         }
 

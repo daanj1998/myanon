@@ -1,7 +1,22 @@
 use pyo3::prelude::*;
-use pyo3::types::{PyDict, PyModule};
+use pyo3::types::{PyBytes, PyDict, PyModule, PyString};
 use std::ffi::CString;
 use std::path::Path;
+
+/// Decode raw dump bytes into a Python `str` using surrogateescape, so values
+/// that are not valid UTF-8 (latin1 dumps, binary text) round-trip instead of
+/// being mangled into U+FFFD.
+fn bytes_to_pystr<'py>(py: Python<'py>, data: &[u8]) -> PyResult<Bound<'py, PyAny>> {
+    PyBytes::new(py, data).call_method1("decode", ("utf-8", "surrogateescape"))
+}
+
+/// Encode a Python `str` back to raw bytes with surrogateescape, restoring any
+/// non-UTF-8 bytes the value carried in.
+fn pystr_to_bytes(obj: &Bound<'_, PyAny>) -> PyResult<Vec<u8>> {
+    let s = obj.cast::<PyString>()?;
+    let encoded = s.call_method1("encode", ("utf-8", "surrogateescape"))?;
+    Ok(encoded.cast_into::<PyBytes>()?.as_bytes().to_vec())
+}
 
 /// Holds a reference to the imported Python module and the HMAC secret.
 pub struct PythonRunner {
@@ -138,12 +153,16 @@ def escape_sql_string(s):
     /// Publish the current row context (table name + field/value pairs) into
     /// `myanon_utils._current_table` and `myanon_utils._current_row`.
     /// Field names are passed with surrounding backticks to match the C API.
-    pub fn set_row(&self, table: &str, row: &[(String, String)]) -> Result<(), String> {
+    pub fn set_row(&self, table: &str, row: &[(String, Vec<u8>)]) -> Result<(), String> {
         Python::attach(|py| {
             let utils = self.utils_module.bind(py);
             let dict = PyDict::new(py);
             for (k, v) in row {
-                dict.set_item(k, v).map_err(|e| {
+                let value = bytes_to_pystr(py, v).map_err(|e| {
+                    e.print(py);
+                    "Failed to decode row value".to_string()
+                })?;
+                dict.set_item(k, value).map_err(|e| {
                     e.print(py);
                     "Failed to set row item".to_string()
                 })?;
@@ -163,12 +182,16 @@ def escape_sql_string(s):
     /// Call a named function in the user's Python module.
     /// If `params` is empty, the function is called with a single string argument `(value,)`.
     /// Otherwise it is called with `(value, params)`.
-    pub fn call(&self, func_name: &str, value: &str, params: &str) -> Result<String, String> {
+    pub fn call(&self, func_name: &str, value: &[u8], params: &str) -> Result<Vec<u8>, String> {
         Python::attach(|py| {
             let module = self.module.bind(py);
             let func = module.getattr(func_name).map_err(|e| {
                 e.print(py);
                 format!("Python function '{}' not found", func_name)
+            })?;
+            let value = bytes_to_pystr(py, value).map_err(|e| {
+                e.print(py);
+                "Failed to decode value".to_string()
             })?;
             let result = if params.is_empty() {
                 func.call1((value,))
@@ -179,14 +202,13 @@ def escape_sql_string(s):
                 e.print(py);
                 format!("Python function '{}' call failed", func_name)
             })?;
-            let result_str: String = result.extract::<String>().map_err(|e| {
+            pystr_to_bytes(&result).map_err(|e| {
                 e.print(py);
                 format!(
                     "Python function '{}' did not return a string",
                     func_name
                 )
-            })?;
-            Ok(result_str)
+            })
         })
     }
 }
