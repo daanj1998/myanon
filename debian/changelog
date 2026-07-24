@@ -1,3 +1,14 @@
+myanon (0.8.4-1) unstable; urgency=medium
+
+  * New upstream release
+  * New features:
+    - Add support for the MariaDB UUID data type (#55)
+  * Bug fixes:
+    - Fix crash when a pydef receives a value that is not valid UTF-8
+      (e.g. a latin1 dump); such values now round-trip unchanged
+
+ -- Pierre POMES <pierre.pomes@gmail.com>  Fri, 24 Jul 2026 14:47:14 -0400
+
 myanon (0.8.3-1) unstable; urgency=medium
 
   * New upstream release
